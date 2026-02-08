@@ -1,0 +1,15 @@
+.{
+    .name = .salesdb,
+    .version = "0.1.0",
+    .fingerprint = 0x27e42c94e44f57b4,
+    .dependencies = .{
+        .shinydb_zig_client = .{
+            .path = "../shinydb-zig-client",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
