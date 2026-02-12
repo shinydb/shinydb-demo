@@ -61,4 +61,26 @@ pub fn build(b: *std.Build) void {
 
     const demo_run_step = b.step("run-demo", "Run the sales demo");
     demo_run_step.dependOn(&demo_run_cmd.step);
+
+    // Query test executable
+    const test_exe = b.addExecutable(.{
+        .name = "query-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/query_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "shinydb_zig_client", .module = shinydb_client.module("shinydb_zig_client") },
+            },
+        }),
+    });
+
+    b.installArtifact(test_exe);
+
+    // Run tests step
+    const test_run_cmd = b.addRunArtifact(test_exe);
+    test_run_cmd.step.dependOn(b.getInstallStep());
+
+    const test_run_step = b.step("test", "Run query correctness tests");
+    test_run_step.dependOn(&test_run_cmd.step);
 }

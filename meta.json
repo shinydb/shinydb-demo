@@ -1,0 +1,115 @@
+{
+  "spaces": [
+    {
+      "id": 1,
+      "ns": "sales",
+      "description": null,
+      "created_at": 1770873204561
+    },
+    {
+      "id": 0,
+      "ns": "system",
+      "description": "System namespace for metadata",
+      "created_at": 1770905285265
+    }
+  ],
+  "stores": [
+    {
+      "id": 1,
+      "store_id": 102,
+      "ns": "sales.orders",
+      "description": null,
+      "created_at": 1770873204564
+    },
+    {
+      "id": 0,
+      "store_id": 101,
+      "ns": "_system.users",
+      "description": "System user accounts",
+      "created_at": 1770873191304
+    },
+    {
+      "id": 8,
+      "store_id": 109,
+      "ns": "sales.vendorproducts",
+      "description": null,
+      "created_at": 1770873204586
+    },
+    {
+      "id": 4,
+      "store_id": 105,
+      "ns": "sales.products",
+      "description": null,
+      "created_at": 1770873204574
+    },
+    {
+      "id": 5,
+      "store_id": 106,
+      "ns": "sales.productcategories",
+      "description": null,
+      "created_at": 1770873204577
+    },
+    {
+      "id": 2,
+      "store_id": 103,
+      "ns": "sales.customers",
+      "description": null,
+      "created_at": 1770873204568
+    },
+    {
+      "id": 3,
+      "store_id": 104,
+      "ns": "sales.employees",
+      "description": null,
+      "created_at": 1770873204571
+    },
+    {
+      "id": 7,
+      "store_id": 108,
+      "ns": "sales.vendors",
+      "description": null,
+      "created_at": 1770873204583
+    },
+    {
+      "id": 6,
+      "store_id": 107,
+      "ns": "sales.productsubcategories",
+      "description": null,
+      "created_at": 1770873204580
+    }
+  ],
+  "indexes": [
+    {
+      "id": 2,
+      "store_id": 103,
+      "ns": "sales.customers.first_name_idx",
+      "field": "FirstName",
+      "field_type": "String",
+      "unique": false,
+      "description": null,
+      "created_at": 1770873630412
+    },
+    {
+      "id": 3,
+      "store_id": 102,
+      "ns": "sales.orders.employe_id_idx",
+      "field": "EmployeeID",
+      "field_type": "I32",
+      "unique": false,
+      "description": null,
+      "created_at": 1770905520551
+    },
+    {
+      "id": 1,
+      "store_id": 102,
+      "ns": "sales.orders.order_id_idx",
+      "field": "SalesOrderID",
+      "field_type": "I32",
+      "unique": false,
+      "description": null,
+      "created_at": 1770873367801
+    }
+  ],
+  "users": [],
+  "backups": []
+}
