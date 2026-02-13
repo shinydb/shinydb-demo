@@ -155,6 +155,31 @@ fn bsonGetSubDoc(data: []const u8, field_name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Get a field value from a BSON document using a dotted path like "address.city"
+/// Uses bsonGetSubDoc to navigate into sub-documents, then bsonGetField for leaf
+fn bsonGetNestedField(data: []const u8, field_path: []const u8) BsonFieldValue {
+    // Find the first dot
+    var dot_pos: ?usize = null;
+    for (field_path, 0..) |c, i| {
+        if (c == '.') {
+            dot_pos = i;
+            break;
+        }
+    }
+
+    if (dot_pos) |dp| {
+        // Split into parent and rest
+        const parent = field_path[0..dp];
+        const rest = field_path[dp + 1 ..];
+        // Navigate into the sub-document
+        const sub_doc = bsonGetSubDoc(data, parent) orelse return .not_found;
+        return bsonGetNestedField(sub_doc, rest);
+    } else {
+        // No dot — leaf field
+        return bsonGetField(data, field_path);
+    }
+}
+
 /// Navigate aggregation response: root -> groups[0] -> values -> field
 /// Server format: { "groups": [{"key": ..., "values": {field: value}}], "total_groups": N }
 fn getAggFieldFromResponse(data: []const u8, field_name: []const u8) BsonFieldValue {
@@ -183,6 +208,22 @@ fn bsonGetFieldFromNth(data: []const u8, n: usize, field_name: []const u8) BsonF
         if (doc_size < 5 or pos + @as(usize, @intCast(doc_size)) > data.len) break;
         if (idx == n) {
             return bsonGetField(data[pos .. pos + @as(usize, @intCast(doc_size))], field_name);
+        }
+        pos += @as(usize, @intCast(doc_size));
+        idx += 1;
+    }
+    return .not_found;
+}
+
+/// Get a nested field from the Nth BSON document in concatenated data (dotted path)
+fn bsonGetNestedFieldFromNth(data: []const u8, n: usize, field_path: []const u8) BsonFieldValue {
+    var pos: usize = 0;
+    var idx: usize = 0;
+    while (pos + 4 <= data.len) {
+        const doc_size = std.mem.readInt(i32, data[pos..][0..4], .little);
+        if (doc_size < 5 or pos + @as(usize, @intCast(doc_size)) > data.len) break;
+        if (idx == n) {
+            return bsonGetNestedField(data[pos .. pos + @as(usize, @intCast(doc_size))], field_path);
         }
         pos += @as(usize, @intCast(doc_size));
         idx += 1;
@@ -244,7 +285,9 @@ fn executeYql(allocator: std.mem.Allocator, client: *ShinyDbClient, input: []con
 
     if (query_ast.limit_val) |lim| _ = query.limit(lim);
     if (query_ast.skip_val) |sk| _ = query.skip(sk);
-    if (query_ast.order_by) |ob| _ = query.orderBy(ob.field, ob.direction);
+    if (query_ast.order_by) |ob| {
+        for (ob.items) |spec| _ = query.orderBy(spec.field, spec.direction);
+    }
 
     if (query_ast.group_by) |gb| {
         for (gb.items) |field| _ = query.groupBy(field);
@@ -271,6 +314,11 @@ fn executeYql(allocator: std.mem.Allocator, client: *ShinyDbClient, input: []con
     }
 
     if (query_ast.query_type == .count) _ = query.countOnly();
+
+    // Pass projection if present
+    if (query_ast.projection) |proj| {
+        _ = query.select(proj.items);
+    }
 
     const response = try query.run();
     return response;
@@ -871,6 +919,244 @@ fn testBuilderOrderFloat(client: *ShinyDbClient, id: []const u8, desc: []const u
     }
 }
 
+// ─── Projection Test Helpers ────────────────────────────────────────────────
+
+/// Test that a YQL projection query returns docs with only the specified fields
+/// present_fields: fields that MUST exist in the result
+/// absent_fields: fields that MUST NOT exist in the result
+fn testProjection(allocator: std.mem.Allocator, client: *ShinyDbClient, id: []const u8, yql_text: []const u8, present_fields: []const []const u8, absent_fields: []const []const u8) void {
+    var response = executeYql(allocator, client, yql_text) catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, yql_text, detail);
+        return;
+    };
+    defer response.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, yql_text, "No data in response");
+        return;
+    };
+
+    // Parse the first BSON document from the response
+    if (data.len < 4) {
+        reportFail(id, yql_text, "Response too short");
+        return;
+    }
+    const doc_size = std.mem.readInt(i32, data[0..4], .little);
+    if (doc_size < 5 or doc_size > data.len) {
+        reportFail(id, yql_text, "Invalid BSON doc size");
+        return;
+    }
+    const doc_bytes = data[0..@intCast(doc_size)];
+
+    // Check that present_fields exist
+    for (present_fields) |field| {
+        const val = bsonGetField(doc_bytes, field);
+        if (val == .not_found) {
+            var buf: [256]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "expected field '{s}' not found in projected doc", .{field}) catch "missing field";
+            reportFail(id, yql_text, detail);
+            return;
+        }
+    }
+
+    // Check that absent_fields do NOT exist
+    for (absent_fields) |field| {
+        const val = bsonGetField(doc_bytes, field);
+        if (val != .not_found) {
+            var buf: [256]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "field '{s}' should NOT be in projected doc", .{field}) catch "extra field";
+            reportFail(id, yql_text, detail);
+            return;
+        }
+    }
+
+    reportPass(id, yql_text);
+}
+
+/// Test that a Builder projection query returns docs with only the specified fields
+fn testBuilderProjection(client: *ShinyDbClient, id: []const u8, desc: []const u8, build_fn: *const fn (client: *ShinyDbClient) QueryBuildResult, present_fields: []const []const u8, absent_fields: []const []const u8) void {
+    const build_result = build_fn(client);
+    var query = build_result.query;
+    var response = query.run() catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, desc, detail);
+        query.deinit();
+        return;
+    };
+    defer response.deinit();
+    query.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, desc, "No data in response");
+        return;
+    };
+
+    // Parse the first BSON document from the response
+    if (data.len < 4) {
+        reportFail(id, desc, "Response too short");
+        return;
+    }
+    const doc_size = std.mem.readInt(i32, data[0..4], .little);
+    if (doc_size < 5 or doc_size > data.len) {
+        reportFail(id, desc, "Invalid BSON doc size");
+        return;
+    }
+    const doc_bytes = data[0..@intCast(doc_size)];
+
+    // Check that present_fields exist
+    for (present_fields) |field| {
+        const val = bsonGetField(doc_bytes, field);
+        if (val == .not_found) {
+            var buf: [256]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "expected field '{s}' not found in projected doc", .{field}) catch "missing field";
+            reportFail(id, desc, detail);
+            return;
+        }
+    }
+
+    // Check that absent_fields do NOT exist
+    for (absent_fields) |field| {
+        const val = bsonGetField(doc_bytes, field);
+        if (val != .not_found) {
+            var buf: [256]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "field '{s}' should NOT be in projected doc", .{field}) catch "extra field";
+            reportFail(id, desc, detail);
+            return;
+        }
+    }
+
+    reportPass(id, desc);
+}
+
+// ─── Multi-Sort Test Helpers ────────────────────────────────────────────────
+
+const SortDir = enum { asc, desc };
+const SortField = struct { name: []const u8, dir: SortDir };
+
+/// Convert a BsonFieldValue to f64 for numeric comparison (returns null for non-numeric)
+fn bsonValToF64(val: BsonFieldValue) ?f64 {
+    return switch (val) {
+        .int32 => |v| @as(f64, @floatFromInt(v)),
+        .int64 => |v| @as(f64, @floatFromInt(v)),
+        .double => |v| v,
+        else => null,
+    };
+}
+
+/// Compare two BsonFieldValues, returns .lt, .gt, or .eq
+fn compareBsonFieldValues(a: BsonFieldValue, b: BsonFieldValue) std.math.Order {
+    // Numeric comparison (cross-type)
+    const a_num = bsonValToF64(a);
+    const b_num = bsonValToF64(b);
+    if (a_num != null and b_num != null) {
+        return std.math.order(a_num.?, b_num.?);
+    }
+    // String comparison
+    if (a == .string and b == .string) {
+        return std.mem.order(u8, a.string, b.string);
+    }
+    return .eq;
+}
+
+/// Test that a YQL multi-sort query returns docs in correct multi-field order
+fn testMultiSortOrder(allocator: std.mem.Allocator, client: *ShinyDbClient, id: []const u8, yql_text: []const u8, sort_fields: []const SortField, min_docs: usize) void {
+    var response = executeYql(allocator, client, yql_text) catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, yql_text, detail);
+        return;
+    };
+    defer response.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, yql_text, "No data in response");
+        return;
+    };
+
+    const num_docs = countBsonDocs(data);
+    if (num_docs < min_docs) {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "expected >= {d} docs, got {d}", .{ min_docs, num_docs }) catch "too few docs";
+        reportFail(id, yql_text, detail);
+        return;
+    }
+
+    // Validate ordering: for each adjacent pair, the multi-sort order must hold
+    var i: usize = 0;
+    while (i + 1 < num_docs) : (i += 1) {
+        for (sort_fields) |sf| {
+            const a_val = bsonGetFieldFromNth(data, i, sf.name);
+            const b_val = bsonGetFieldFromNth(data, i + 1, sf.name);
+            const cmp = compareBsonFieldValues(a_val, b_val);
+            if (cmp == .eq) continue; // tie → check next sort field
+            // Not a tie: must be in the right direction
+            const expected: std.math.Order = if (sf.dir == .asc) .lt else .gt;
+            if (cmp != expected) {
+                var buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&buf, "Doc[{d}] vs Doc[{d}]: field '{s}' out of order", .{ i, i + 1, sf.name }) catch "sort order violation";
+                reportFail(id, yql_text, detail);
+                return;
+            }
+            break; // primary field resolved the order, don't check secondary
+        }
+    }
+
+    reportPass(id, yql_text);
+}
+
+/// Test that a Builder multi-sort query returns docs in correct multi-field order
+fn testBuilderMultiSortOrder(client: *ShinyDbClient, id: []const u8, desc_text: []const u8, build_fn: *const fn (client: *ShinyDbClient) QueryBuildResult, sort_fields: []const SortField, min_docs: usize) void {
+    const build_result = build_fn(client);
+    var query = build_result.query;
+    var response = query.run() catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, desc_text, detail);
+        query.deinit();
+        return;
+    };
+    defer response.deinit();
+    query.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, desc_text, "No data in response");
+        return;
+    };
+
+    const num_docs = countBsonDocs(data);
+    if (num_docs < min_docs) {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "expected >= {d} docs, got {d}", .{ min_docs, num_docs }) catch "too few docs";
+        reportFail(id, desc_text, detail);
+        return;
+    }
+
+    // Validate ordering: for each adjacent pair, the multi-sort order must hold
+    var i: usize = 0;
+    while (i + 1 < num_docs) : (i += 1) {
+        for (sort_fields) |sf| {
+            const a_val = bsonGetFieldFromNth(data, i, sf.name);
+            const b_val = bsonGetFieldFromNth(data, i + 1, sf.name);
+            const cmp = compareBsonFieldValues(a_val, b_val);
+            if (cmp == .eq) continue; // tie → check next sort field
+            // Not a tie: must be in the right direction
+            const expected: std.math.Order = if (sf.dir == .asc) .lt else .gt;
+            if (cmp != expected) {
+                var buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&buf, "Doc[{d}] vs Doc[{d}]: field '{s}' out of order", .{ i, i + 1, sf.name }) catch "sort order violation";
+                reportFail(id, desc_text, detail);
+                return;
+            }
+            break; // primary field resolved the order, don't check secondary
+        }
+    }
+
+    reportPass(id, desc_text);
+}
+
 // ─── Builder Query Constructors (Categories 11–20) ─────────────────────────
 
 // 11.x — Count queries
@@ -1153,6 +1439,413 @@ fn b20_2(client: *ShinyDbClient) QueryBuildResult {
     return .{ .query = q };
 }
 
+// ─── Phase 1 Builder Query Constructors ────────────────────────────────────
+
+const Value = shinydb.yql.Value;
+
+// 21.x — $in operator
+fn b21_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .in, .{ .array = @constCast(&[_]Value{ .{ .int = 289 }, .{ .int = 288 } }) }).countOnly();
+    return .{ .query = q };
+}
+fn b21_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .in, .{ .array = @constCast(&[_]Value{ .{ .int = 289 }, .{ .int = 287 }, .{ .int = 285 } }) }).countOnly();
+    return .{ .query = q };
+}
+fn b21_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("SubCategoryID", .in, .{ .array = @constCast(&[_]Value{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 14 } }) }).countOnly();
+    return .{ .query = q };
+}
+fn b21_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("Gender", .in, .{ .array = @constCast(&[_]Value{.{ .string = "M" }}) }).countOnly();
+    return .{ .query = q };
+}
+fn b21_5(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("MaritalStatus", .in, .{ .array = @constCast(&[_]Value{ .{ .string = "S" }, .{ .string = "M" } }) }).countOnly();
+    return .{ .query = q };
+}
+
+// 22.x — $contains
+fn b22_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .contains, .{ .string = "Road" }).countOnly();
+    return .{ .query = q };
+}
+fn b22_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .contains, .{ .string = "Mountain" }).countOnly();
+    return .{ .query = q };
+}
+fn b22_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .contains, .{ .string = "Frame" }).countOnly();
+    return .{ .query = q };
+}
+fn b22_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("vendors").where("VendorName", .contains, .{ .string = "Bike" }).countOnly();
+    return .{ .query = q };
+}
+
+// 23.x — $startsWith
+fn b23_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .starts_with, .{ .string = "HL" }).countOnly();
+    return .{ .query = q };
+}
+fn b23_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .starts_with, .{ .string = "Mountain" }).countOnly();
+    return .{ .query = q };
+}
+fn b23_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("FirstName", .starts_with, .{ .string = "S" }).countOnly();
+    return .{ .query = q };
+}
+
+// 24.x — $exists
+fn b24_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .exists, .{ .bool = true }).countOnly();
+    return .{ .query = q };
+}
+fn b24_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("Gender", .exists, .{ .bool = true }).countOnly();
+    return .{ .query = q };
+}
+fn b24_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("Color", .exists, .{ .bool = true }).countOnly();
+    return .{ .query = q };
+}
+fn b24_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("Salary", .exists, .{ .bool = true }).countOnly();
+    return .{ .query = q };
+}
+
+// 25.x — $regex
+fn b25_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .regex, .{ .string = "^HL" }).countOnly();
+    return .{ .query = q };
+}
+fn b25_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .regex, .{ .string = "Frame" }).countOnly();
+    return .{ .query = q };
+}
+fn b25_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .regex, .{ .string = "58$" }).countOnly();
+    return .{ .query = q };
+}
+fn b25_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .regex, .{ .string = "^AWC Logo Cap$" }).countOnly();
+    return .{ .query = q };
+}
+
+// ─── Phase 2: Builder OR functions ──────────────────────────────────
+
+fn b31_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("Gender", .eq, .{ .string = "M" }).@"or"("MaritalStatus", .eq, .{ .string = "S" }).countOnly();
+    return .{ .query = q };
+}
+
+fn b31_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("ProductName", .contains, .{ .string = "Road" }).@"or"("ProductName", .contains, .{ .string = "Mountain" }).countOnly();
+    return .{ .query = q };
+}
+
+fn b31_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("SubCategoryID", .eq, .{ .int = 1 }).@"or"("SubCategoryID", .eq, .{ .int = 2 }).countOnly();
+    return .{ .query = q };
+}
+
+fn b31_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("TotalDue", .gt, .{ .float = 100000 }).@"or"("TotalDue", .lt, .{ .float = 100 }).countOnly();
+    return .{ .query = q };
+}
+
+fn b31_5(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .eq, .{ .int = 289 }).@"or"("EmployeeID", .eq, .{ .int = 288 }).countOnly();
+    return .{ .query = q };
+}
+
+// ─── Phase 3: Builder Range Index Scan functions ───────────────────────
+
+// 40.1: EmployeeID >= 285 and <= 287 (closed range, indexed) — same as 3.8 but via builder
+fn b40_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gte, .{ .int = 285 }).@"and"("EmployeeID", .lte, .{ .int = 287 }).countOnly();
+    return .{ .query = q };
+}
+
+// 40.2: EmployeeID >= 288 and <= 289 (should equal sum of 288+289 = 478)
+fn b40_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gte, .{ .int = 288 }).@"and"("EmployeeID", .lte, .{ .int = 289 }).countOnly();
+    return .{ .query = q };
+}
+
+// 40.3: EmployeeID > 288 (exclusive lower bound)
+fn b40_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gt, .{ .int = 288 }).countOnly();
+    return .{ .query = q };
+}
+
+// 40.4: EmployeeID < 285 (upper bound only, no lower bound)
+fn b40_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .lt, .{ .int = 285 }).countOnly();
+    return .{ .query = q };
+}
+
+// 40.5: EmployeeID >= 289 and <= 289 (range that equals equality)
+fn b40_5(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gte, .{ .int = 289 }).@"and"("EmployeeID", .lte, .{ .int = 289 }).countOnly();
+    return .{ .query = q };
+}
+
+// 40.6: EmployeeID > 285 and < 289 (exclusive both bounds)
+fn b40_6(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gt, .{ .int = 285 }).@"and"("EmployeeID", .lt, .{ .int = 289 }).countOnly();
+    return .{ .query = q };
+}
+
+// ─── Phase 4: Builder Projection functions ─────────────────────────────────
+
+// 50.1: Select only EmployeeID and FullName from employees
+fn b50_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").where("EmployeeID", .eq, .{ .int = 274 }).select(&.{ "EmployeeID", "FullName" });
+    return .{ .query = q };
+}
+
+// 50.2: Select only ProductName and ListPrice from products
+fn b50_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").where("SubCategoryID", .eq, .{ .int = 14 }).limit(1).select(&.{ "ProductName", "ListPrice" });
+    return .{ .query = q };
+}
+
+// 50.3: Select single field (EmployeeID only)
+fn b50_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").limit(1).select(&.{"EmployeeID"});
+    return .{ .query = q };
+}
+
+// 50.4: Select with filter + sort
+fn b50_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .eq, .{ .int = 289 }).orderBy("TotalDue", .desc).limit(1).select(&.{ "EmployeeID", "TotalDue" });
+    return .{ .query = q };
+}
+
+// ─── Phase 5: Builder Multi-Sort functions ─────────────────────────────────
+
+// 60.1: Orders sorted by EmployeeID asc, TotalDue desc — limit 10
+fn b60_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").orderBy("EmployeeID", .asc).orderBy("TotalDue", .desc).limit(10);
+    return .{ .query = q };
+}
+
+// 60.2: Employees sorted by Gender asc, EmployeeID desc — limit 10
+fn b60_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("employees").orderBy("Gender", .asc).orderBy("EmployeeID", .desc).limit(10);
+    return .{ .query = q };
+}
+
+// 60.3: Products sorted by SubCategoryID asc, ListPrice desc — limit 10
+fn b60_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("products").orderBy("SubCategoryID", .asc).orderBy("ListPrice", .desc).limit(10);
+    return .{ .query = q };
+}
+
+// 60.4: Orders filtered by EmployeeID >= 285, sorted by EmployeeID asc, TotalDue asc — limit 20
+fn b60_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("orders").where("EmployeeID", .gte, .{ .int = 285 }).orderBy("EmployeeID", .asc).orderBy("TotalDue", .asc).limit(20);
+    return .{ .query = q };
+}
+
+// ─── Phase 6: Nested Field Tests use sales.customers with Address sub-document ──
+
+// ─── Phase 6: Builder Functions ────────────────────────────────────────────
+
+/// Test that a builder query returns docs with nested field values in expected order
+fn testBuilderNestedStrOrder(
+    client: *ShinyDbClient,
+    id: []const u8,
+    desc: []const u8,
+    build_fn: *const fn (client: *ShinyDbClient) QueryBuildResult,
+    nested_field: []const u8,
+    expected_values: []const []const u8,
+) void {
+    const build_result = build_fn(client);
+    var query = build_result.query;
+
+    var response = query.run() catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, desc, detail);
+        query.deinit();
+        return;
+    };
+    defer response.deinit();
+    query.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, desc, "No data in response");
+        return;
+    };
+
+    for (expected_values, 0..) |exp, i| {
+        const val = bsonGetNestedFieldFromNth(data, i, nested_field);
+        switch (val) {
+            .string => |s| {
+                if (!std.mem.eql(u8, s, exp)) {
+                    var buf: [256]u8 = undefined;
+                    const detail = std.fmt.bufPrint(&buf, "Doc[{d}] {s}: expected=\"{s}\", got=\"{s}\"", .{ i, nested_field, exp, s }) catch "mismatch";
+                    reportFail(id, desc, detail);
+                    return;
+                }
+            },
+            else => {
+                var buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&buf, "Doc[{d}] nested field '{s}' not found", .{ i, nested_field }) catch "not found";
+                reportFail(id, desc, detail);
+                return;
+            },
+        }
+    }
+    reportPass(id, desc);
+}
+
+/// Test that a builder query returns docs with nested int field values in expected order
+fn testBuilderNestedIntOrder(
+    client: *ShinyDbClient,
+    id: []const u8,
+    desc: []const u8,
+    build_fn: *const fn (client: *ShinyDbClient) QueryBuildResult,
+    nested_field: []const u8,
+    expected_values: []const i32,
+) void {
+    const build_result = build_fn(client);
+    var query = build_result.query;
+
+    var response = query.run() catch |err| {
+        var buf: [256]u8 = undefined;
+        const detail = std.fmt.bufPrint(&buf, "Query failed: {}", .{err}) catch "Query failed";
+        reportFail(id, desc, detail);
+        query.deinit();
+        return;
+    };
+    defer response.deinit();
+    query.deinit();
+
+    const data = response.data orelse {
+        reportFail(id, desc, "No data in response");
+        return;
+    };
+
+    for (expected_values, 0..) |exp, i| {
+        const val = bsonGetNestedFieldFromNth(data, i, nested_field);
+        const actual: i32 = switch (val) {
+            .int32 => |v| v,
+            else => {
+                var buf: [256]u8 = undefined;
+                const detail = std.fmt.bufPrint(&buf, "Doc[{d}] nested field '{s}' not found/wrong type", .{ i, nested_field }) catch "not found";
+                reportFail(id, desc, detail);
+                return;
+            },
+        };
+        if (actual != exp) {
+            var buf: [256]u8 = undefined;
+            const detail = std.fmt.bufPrint(&buf, "Doc[{d}] {s}: expected={d}, got={d}", .{ i, nested_field, exp, actual }) catch "mismatch";
+            reportFail(id, desc, detail);
+            return;
+        }
+    }
+    reportPass(id, desc);
+}
+
+// 70.1: Filter by nested string — Address.City = "New York" → 46 customers
+fn b70_1(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.City", .eq, .{ .string = "New York" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.2: Filter by nested string — Address.State = "CA" → 111 customers
+fn b70_2(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.State", .eq, .{ .string = "CA" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.3: Filter by nested string — Address.City = "Chicago" → 49 customers
+fn b70_3(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.City", .eq, .{ .string = "Chicago" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.4: Filter by nested string — Address.State = "TX" → 84 customers
+fn b70_4(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.State", .eq, .{ .string = "TX" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.5: Filter by nested string — Address.Country = "US" → 635 (all customers)
+fn b70_5(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.Country", .eq, .{ .string = "US" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.6: Filter by nested string — Address.State = "FL" → 53 customers
+fn b70_6(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.State", .eq, .{ .string = "FL" }).countOnly();
+    return .{ .query = q };
+}
+
+// 70.7: Sort by nested field — orderBy(Address.City, asc).limit(5) → first 5 alphabetical cities
+fn b70_7(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").orderBy("Address.City", .asc).limit(5);
+    return .{ .query = q };
+}
+
+// 70.8: Filter + sort — Address.State = "NY" sorted by Address.ZipCode asc, limit 5
+fn b70_8(client: *ShinyDbClient) QueryBuildResult {
+    var q = Query.init(client);
+    _ = q.space("sales").store("customers").where("Address.State", .eq, .{ .string = "NY" }).orderBy("Address.ZipCode", .asc).limit(5);
+    return .{ .query = q };
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -1172,6 +1865,8 @@ pub fn main() !void {
     std.debug.print("Connecting to shinydb at 127.0.0.1:23469...\n", .{});
     try client.connect("127.0.0.1", 23469);
     std.debug.print("Connected!\n\n", .{});
+
+    // Phase 6 uses sales.customers with nested Address sub-document (no extra setup needed)
 
     pass_count = 0;
     fail_count = 0;
@@ -1270,17 +1965,82 @@ pub fn main() !void {
     testGroupCount(allocator, client, "10.1", "sales.orders.filter(TotalDue > 10000).groupBy(EmployeeID).aggregate(n: count)", 17);
     testGroupCount(allocator, client, "10.2", "sales.products.filter(ListPrice > 0).groupBy(SubCategoryID).aggregate(n: count, avg_price: avg(ListPrice))", 37);
 
-    const yql_pass = pass_count;
-    const yql_fail = fail_count;
+    var yql_pass: usize = pass_count;
+    var yql_fail: usize = fail_count;
 
     // ════════════════════════════════════════════════════════════════
-    // Builder API Tests (Categories 11–20, 50 tests)
+    // Phase 1 — YQL Tests for new operators (Categories 21–25)
+    // ════════════════════════════════════════════════════════════════
+    std.debug.print("\n═══ Phase 1: YQL Operator Tests ═══\n\n", .{});
+
+    // ── Category 21: YQL $in ──
+    std.debug.print("── Category 21: YQL $in ──\n", .{});
+    testCount(allocator, client, "21.1", "sales.orders.filter(EmployeeID in [289, 288]).count()", 478);
+    testCount(allocator, client, "21.2", "sales.orders.filter(EmployeeID in [289, 287, 285]).count()", 403);
+    testCount(allocator, client, "21.3", "sales.products.filter(SubCategoryID in [1, 2, 14]).count()", 108);
+    testCount(allocator, client, "21.4",
+        \\sales.employees.filter(Gender in ["M"]).count()
+    , 10);
+    testCount(allocator, client, "21.5",
+        \\sales.employees.filter(MaritalStatus in ["S", "M"]).count()
+    , 17);
+
+    // ── Category 22: YQL $contains ──
+    std.debug.print("── Category 22: YQL $contains ──\n", .{});
+    testCount(allocator, client, "22.1",
+        \\sales.products.filter(ProductName contains "Road").count()
+    , 96);
+    testCount(allocator, client, "22.2",
+        \\sales.products.filter(ProductName contains "Mountain").count()
+    , 87);
+    testCount(allocator, client, "22.3",
+        \\sales.products.filter(ProductName contains "Frame").count()
+    , 79);
+    testCount(allocator, client, "22.4",
+        \\sales.vendors.filter(VendorName contains "Bike").count()
+    , 22);
+
+    // ── Category 23: YQL $startsWith ──
+    std.debug.print("── Category 23: YQL $startsWith ──\n", .{});
+    testCount(allocator, client, "23.1",
+        \\sales.products.filter(ProductName startsWith "HL").count()
+    , 47);
+    testCount(allocator, client, "23.2",
+        \\sales.products.filter(ProductName startsWith "Mountain").count()
+    , 37);
+    testCount(allocator, client, "23.3",
+        \\sales.employees.filter(FirstName startsWith "S").count()
+    , 3);
+
+    // ── Category 24: YQL $exists ──
+    std.debug.print("── Category 24: YQL $exists ──\n", .{});
+    testCount(allocator, client, "24.1", "sales.products.filter(ProductName exists true).count()", 295);
+    testCount(allocator, client, "24.2", "sales.employees.filter(Gender exists true).count()", 17);
+    testCount(allocator, client, "24.3", "sales.products.filter(Color exists true).count()", 0);
+    testCount(allocator, client, "24.4", "sales.employees.filter(Salary exists true).count()", 0);
+
+    // ── Category 25: YQL $regex ──
+    std.debug.print("── Category 25: YQL $regex ──\n", .{});
+    testCount(allocator, client, "25.1",
+        \\sales.products.filter(ProductName ~ "^HL").count()
+    , 47);
+    testCount(allocator, client, "25.2",
+        \\sales.products.filter(ProductName ~ "Frame").count()
+    , 79);
+    testCount(allocator, client, "25.3",
+        \\sales.products.filter(ProductName ~ "58$").count()
+    , 15);
+    testCount(allocator, client, "25.4",
+        \\sales.products.filter(ProductName ~ "^AWC Logo Cap$").count()
+    , 1);
+
+    yql_pass = pass_count;
+    yql_fail = fail_count;
+
+    // ════════════════════════════════════════════════════════════════
+    // Builder API Tests (Categories 11–20)
     // ════════════════════════════════════════════════════════════════
     std.debug.print("\n═══ Builder API Tests ═══\n\n", .{});
-
-    // Reset counters for builder section (track separately)
-    const builder_start_pass = pass_count;
-    const builder_start_fail = fail_count;
 
     // ── Category 11: Builder Count ──
     std.debug.print("── Category 11: Builder Count ──\n", .{});
@@ -1364,8 +2124,366 @@ pub fn main() !void {
     testBuilderGroupCount(client, "20.1", "orders.where(TotalDue>10000).groupBy(EmpID).count(n)", &b20_1, 17);
     testBuilderGroupCount(client, "20.2", "products.where(ListPrice>0).groupBy(SubCatID).count+avg", &b20_2, 37);
 
-    const builder_pass = pass_count - builder_start_pass;
-    const builder_fail = fail_count - builder_start_fail;
+    // ════════════════════════════════════════════════════════════════
+    // Phase 1 — Builder Tests for new operators (Categories 21–25)
+    // ════════════════════════════════════════════════════════════════
+    std.debug.print("\n═══ Phase 1: Builder Operator Tests ═══\n\n", .{});
+
+    // ── Category 21: Builder $in ──
+    std.debug.print("── Category 21: Builder $in ──\n", .{});
+    testBuilderCount(client, "21.1", "orders.where(EmpID in [289,288]).countOnly()", &b21_1, 478);
+    testBuilderCount(client, "21.2", "orders.where(EmpID in [289,287,285]).countOnly()", &b21_2, 403);
+    testBuilderCount(client, "21.3", "products.where(SubCatID in [1,2,14]).countOnly()", &b21_3, 108);
+    testBuilderCount(client, "21.4", "employees.where(Gender in ['M']).countOnly()", &b21_4, 10);
+    testBuilderCount(client, "21.5", "employees.where(Marital in ['S','M']).countOnly()", &b21_5, 17);
+
+    // ── Category 22b: Builder $contains ──
+    std.debug.print("── Category 22b: Builder $contains ──\n", .{});
+    testBuilderCount(client, "22b.1", "products.where(ProdName contains Road).countOnly()", &b22_1, 96);
+    testBuilderCount(client, "22b.2", "products.where(ProdName contains Mountain).countOnly()", &b22_2, 87);
+    testBuilderCount(client, "22b.3", "products.where(ProdName contains Frame).countOnly()", &b22_3, 79);
+    testBuilderCount(client, "22b.4", "vendors.where(VendorName contains Bike).countOnly()", &b22_4, 22);
+
+    // ── Category 23: Builder $startsWith ──
+    std.debug.print("── Category 23: Builder $startsWith ──\n", .{});
+    testBuilderCount(client, "23.1", "products.where(ProdName startsWith HL).countOnly()", &b23_1, 47);
+    testBuilderCount(client, "23.2", "products.where(ProdName startsWith Mountain).countOnly()", &b23_2, 37);
+    testBuilderCount(client, "23.3", "employees.where(FirstName startsWith S).countOnly()", &b23_3, 3);
+
+    // ── Category 24b: Builder $exists ──
+    std.debug.print("── Category 24b: Builder $exists ──\n", .{});
+    testBuilderCount(client, "24b.1", "products.where(ProductName exists true).countOnly()", &b24_1, 295);
+    testBuilderCount(client, "24b.2", "employees.where(Gender exists true).countOnly()", &b24_2, 17);
+    testBuilderCount(client, "24b.3", "products.where(Color exists true).countOnly()", &b24_3, 0);
+    testBuilderCount(client, "24b.4", "employees.where(Salary exists true).countOnly()", &b24_4, 0);
+
+    // ── Category 25b: Builder $regex ──
+    std.debug.print("── Category 25b: Builder $regex ──\n", .{});
+    testBuilderCount(client, "25b.1", "products.where(ProdName ~ ^HL).countOnly()", &b25_1, 47);
+    testBuilderCount(client, "25b.2", "products.where(ProdName ~ Frame).countOnly()", &b25_2, 79);
+    testBuilderCount(client, "25b.3", "products.where(ProdName ~ 58$).countOnly()", &b25_3, 15);
+    testBuilderCount(client, "25b.4", "products.where(ProdName ~ ^AWC Logo Cap$).countOnly()", &b25_4, 1);
+
+    const p2_yql_start = pass_count;
+    const p2_yql_fail_start = fail_count;
+
+    // ═══ Phase 2: YQL OR Tests ═══
+    std.debug.print("\n═══ Phase 2: YQL OR Tests ═══\n\n", .{});
+
+    // ── Category 30: YQL OR ──
+    std.debug.print("── Category 30: YQL OR ──\n", .{});
+    testCount(allocator, client, "30.1",
+        \\sales.employees.filter(Gender = "M" or MaritalStatus = "S").count()
+    , 14);
+    testCount(allocator, client, "30.2",
+        \\sales.products.filter(ProductName contains "Road" or ProductName contains "Mountain").count()
+    , 183);
+    testCount(allocator, client, "30.3", "sales.products.filter(SubCategoryID = 1 or SubCategoryID = 2).count()", 75);
+    testCount(allocator, client, "30.4", "sales.orders.filter(TotalDue > 100000 or TotalDue < 100).count()", 263);
+    testCount(allocator, client, "30.5", "sales.orders.filter(EmployeeID = 289 or EmployeeID = 288).count()", 478);
+
+    yql_pass += pass_count - p2_yql_start;
+    yql_fail += fail_count - p2_yql_fail_start;
+
+    // ═══ Phase 2: Builder OR Tests ═══
+    std.debug.print("\n═══ Phase 2: Builder OR Tests ═══\n\n", .{});
+
+    // ── Category 31: Builder OR ──
+    std.debug.print("── Category 31: Builder OR ──\n", .{});
+    testBuilderCount(client, "31.1", "employees.where(Gender=M).or(MaritalStatus=S).countOnly()", &b31_1, 14);
+    testBuilderCount(client, "31.2", "products.where(contains Road).or(contains Mountain).countOnly()", &b31_2, 183);
+    testBuilderCount(client, "31.3", "products.where(SubCatID=1).or(SubCatID=2).countOnly()", &b31_3, 75);
+    testBuilderCount(client, "31.4", "orders.where(TotalDue>100000).or(TotalDue<100).countOnly()", &b31_4, 263);
+    testBuilderCount(client, "31.5", "orders.where(EmpID=289).or(EmpID=288).countOnly()", &b31_5, 478);
+
+    const p3_yql_start = pass_count;
+    const p3_yql_fail_start = fail_count;
+
+    // ═══ Phase 3: Range Index Scan Tests ═══
+    std.debug.print("\n═══ Phase 3: YQL Range Index Scan Tests ═══\n\n", .{});
+
+    // ── Category 40: YQL Range on indexed EmployeeID ──
+    std.debug.print("── Category 40: YQL Range Index Scan ──\n", .{});
+    testCount(allocator, client, "40.1", "sales.orders.filter(EmployeeID >= 285 and EmployeeID <= 287).count()", 164);
+    testCount(allocator, client, "40.2", "sales.orders.filter(EmployeeID >= 288 and EmployeeID <= 289).count()", 478);
+    testCount(allocator, client, "40.3", "sales.orders.filter(EmployeeID >= 289 and EmployeeID <= 289).count()", 348);
+    testCount(allocator, client, "40.4", "sales.orders.filter(EmployeeID > 285 and EmployeeID < 289).count()", 278);
+    testCount(allocator, client, "40.5", "sales.orders.filter(EmployeeID > 288).count()", 523);
+    testCount(allocator, client, "40.6", "sales.orders.filter(EmployeeID < 285).count()", 2989);
+
+    yql_pass += pass_count - p3_yql_start;
+    yql_fail += fail_count - p3_yql_fail_start;
+
+    std.debug.print("\n═══ Phase 3: Builder Range Index Scan Tests ═══\n\n", .{});
+
+    // ── Category 41: Builder Range on indexed EmployeeID ──
+    std.debug.print("── Category 41: Builder Range Index Scan ──\n", .{});
+    testBuilderCount(client, "41.1", "orders.where(EmpID>=285).and(EmpID<=287).countOnly()", &b40_1, 164);
+    testBuilderCount(client, "41.2", "orders.where(EmpID>=288).and(EmpID<=289).countOnly()", &b40_2, 478);
+    testBuilderCount(client, "41.3", "orders.where(EmpID>288).countOnly()", &b40_3, 523);
+    testBuilderCount(client, "41.4", "orders.where(EmpID<285).countOnly()", &b40_4, 2989);
+    testBuilderCount(client, "41.5", "orders.where(EmpID>=289).and(EmpID<=289).countOnly()", &b40_5, 348);
+    testBuilderCount(client, "41.6", "orders.where(EmpID>285).and(EmpID<289).countOnly()", &b40_6, 278);
+
+    const p4_yql_start = pass_count;
+    const p4_yql_fail_start = fail_count;
+
+    // ═══ Phase 4: Projection Tests ═══
+    std.debug.print("\n═══ Phase 4: YQL Projection Tests ═══\n\n", .{});
+
+    // ── Category 50: YQL Projection ──
+    std.debug.print("── Category 50: YQL Projection ──\n", .{});
+    testProjection(
+        allocator,
+        client,
+        "50.1",
+        "sales.employees.filter(EmployeeID = 274).pluck(EmployeeID, FullName)",
+        &.{ "EmployeeID", "FullName" },
+        &.{ "Gender", "JobTitle", "MaritalStatus", "Territory" },
+    );
+    testProjection(
+        allocator,
+        client,
+        "50.2",
+        "sales.products.filter(SubCategoryID = 14).limit(1).pluck(ProductName, ListPrice)",
+        &.{ "ProductName", "ListPrice" },
+        &.{ "SubCategoryID", "MakeFlag", "StandardCost", "ModelName" },
+    );
+    testProjection(
+        allocator,
+        client,
+        "50.3",
+        "sales.employees.limit(1).pluck(EmployeeID)",
+        &.{"EmployeeID"},
+        &.{ "FullName", "Gender", "JobTitle" },
+    );
+    testProjection(
+        allocator,
+        client,
+        "50.4",
+        "sales.orders.filter(EmployeeID = 289).orderBy(TotalDue, desc).limit(1).pluck(EmployeeID, TotalDue)",
+        &.{ "EmployeeID", "TotalDue" },
+        &.{ "CustomerID", "SubTotal", "Freight" },
+    );
+
+    yql_pass += pass_count - p4_yql_start;
+    yql_fail += fail_count - p4_yql_fail_start;
+
+    std.debug.print("\n═══ Phase 4: Builder Projection Tests ═══\n\n", .{});
+
+    // ── Category 51: Builder Projection ──
+    std.debug.print("── Category 51: Builder Projection ──\n", .{});
+    testBuilderProjection(
+        client,
+        "51.1",
+        "employees.where(EmpID=274).select(EmployeeID, FullName)",
+        &b50_1,
+        &.{ "EmployeeID", "FullName" },
+        &.{ "Gender", "JobTitle", "MaritalStatus", "Territory" },
+    );
+    testBuilderProjection(
+        client,
+        "51.2",
+        "products.where(SubCat=14).limit(1).select(ProductName, ListPrice)",
+        &b50_2,
+        &.{ "ProductName", "ListPrice" },
+        &.{ "SubCategoryID", "MakeFlag", "StandardCost", "ModelName" },
+    );
+    testBuilderProjection(
+        client,
+        "51.3",
+        "employees.limit(1).select(EmployeeID)",
+        &b50_3,
+        &.{"EmployeeID"},
+        &.{ "FullName", "Gender", "JobTitle" },
+    );
+    testBuilderProjection(
+        client,
+        "51.4",
+        "orders.where(EmpID=289).orderBy(TotalDue desc).limit(1).select(EmployeeID, TotalDue)",
+        &b50_4,
+        &.{ "EmployeeID", "TotalDue" },
+        &.{ "CustomerID", "SubTotal", "Freight" },
+    );
+
+    const p5_yql_start = pass_count;
+    const p5_yql_fail_start = fail_count;
+
+    // ═══ Phase 5: Multi-Sort Tests ═══
+    std.debug.print("\n═══ Phase 5: YQL Multi-Sort Tests ═══\n\n", .{});
+
+    // ── Category 60: YQL Multi-Sort ──
+    std.debug.print("── Category 60: YQL Multi-Sort ──\n", .{});
+    testMultiSortOrder(
+        allocator,
+        client,
+        "60.1",
+        "sales.orders.orderBy(EmployeeID, asc).orderBy(TotalDue, desc).limit(10)",
+        &.{ .{ .name = "EmployeeID", .dir = .asc }, .{ .name = "TotalDue", .dir = .desc } },
+        10,
+    );
+    testMultiSortOrder(
+        allocator,
+        client,
+        "60.2",
+        "sales.employees.orderBy(Gender, asc).orderBy(EmployeeID, desc).limit(10)",
+        &.{ .{ .name = "Gender", .dir = .asc }, .{ .name = "EmployeeID", .dir = .desc } },
+        10,
+    );
+    testMultiSortOrder(
+        allocator,
+        client,
+        "60.3",
+        "sales.products.orderBy(SubCategoryID, asc).orderBy(ListPrice, desc).limit(10)",
+        &.{ .{ .name = "SubCategoryID", .dir = .asc }, .{ .name = "ListPrice", .dir = .desc } },
+        10,
+    );
+    testMultiSortOrder(
+        allocator,
+        client,
+        "60.4",
+        "sales.orders.filter(EmployeeID >= 285).orderBy(EmployeeID, asc).orderBy(TotalDue, asc).limit(20)",
+        &.{ .{ .name = "EmployeeID", .dir = .asc }, .{ .name = "TotalDue", .dir = .asc } },
+        20,
+    );
+
+    yql_pass += pass_count - p5_yql_start;
+    yql_fail += fail_count - p5_yql_fail_start;
+
+    std.debug.print("\n═══ Phase 5: Builder Multi-Sort Tests ═══\n\n", .{});
+
+    // ── Category 61: Builder Multi-Sort ──
+    std.debug.print("── Category 61: Builder Multi-Sort ──\n", .{});
+    testBuilderMultiSortOrder(
+        client,
+        "61.1",
+        "orders.orderBy(EmpID,asc).orderBy(TotalDue,desc).limit(10)",
+        &b60_1,
+        &.{ .{ .name = "EmployeeID", .dir = .asc }, .{ .name = "TotalDue", .dir = .desc } },
+        10,
+    );
+    testBuilderMultiSortOrder(
+        client,
+        "61.2",
+        "employees.orderBy(Gender,asc).orderBy(EmpID,desc).limit(10)",
+        &b60_2,
+        &.{ .{ .name = "Gender", .dir = .asc }, .{ .name = "EmployeeID", .dir = .desc } },
+        10,
+    );
+    testBuilderMultiSortOrder(
+        client,
+        "61.3",
+        "products.orderBy(SubCatID,asc).orderBy(ListPrice,desc).limit(10)",
+        &b60_3,
+        &.{ .{ .name = "SubCategoryID", .dir = .asc }, .{ .name = "ListPrice", .dir = .desc } },
+        10,
+    );
+    testBuilderMultiSortOrder(
+        client,
+        "61.4",
+        "orders.where(EmpID>=285).orderBy(EmpID,asc).orderBy(TotalDue,asc).limit(20)",
+        &b60_4,
+        &.{ .{ .name = "EmployeeID", .dir = .asc }, .{ .name = "TotalDue", .dir = .asc } },
+        20,
+    );
+
+    const p6_yql_start = pass_count;
+    const p6_yql_fail_start = fail_count;
+
+    // ═══ Phase 6: Nested Field Access Tests (using sales.customers with Address) ═══
+    std.debug.print("\n═══ Phase 6: YQL Nested Field Tests ═══\n\n", .{});
+
+    // ── Category 70: YQL Nested Field ──
+    std.debug.print("── Category 70: YQL Nested Field ──\n", .{});
+
+    // 70.1: Filter by nested string — Address.City = "New York" → 46
+    testCount(allocator, client, "70.1",
+        \\sales.customers.filter(Address.City = "New York").count()
+    , 46);
+
+    // 70.2: Filter by nested string — Address.State = "CA" → 111
+    testCount(allocator, client, "70.2",
+        \\sales.customers.filter(Address.State = "CA").count()
+    , 111);
+
+    // 70.3: Filter by nested string — Address.City = "Chicago" → 49
+    testCount(allocator, client, "70.3",
+        \\sales.customers.filter(Address.City = "Chicago").count()
+    , 49);
+
+    // 70.4: Filter by nested string — Address.State = "TX" → 84
+    testCount(allocator, client, "70.4",
+        \\sales.customers.filter(Address.State = "TX").count()
+    , 84);
+
+    // 70.5: Filter by nested string — Address.Country = "US" → 635 (all)
+    testCount(allocator, client, "70.5",
+        \\sales.customers.filter(Address.Country = "US").count()
+    , 635);
+
+    // 70.6: Filter by nested string — Address.State = "FL" → 53
+    testCount(allocator, client, "70.6",
+        \\sales.customers.filter(Address.State = "FL").count()
+    , 53);
+
+    // 70.7: Filter by nested string — Address.City = "Seattle" → 50
+    testCount(allocator, client, "70.7",
+        \\sales.customers.filter(Address.City = "Seattle").count()
+    , 50);
+
+    // 70.8: Filter by nested string — Address.City = "Boston" → 31
+    testCount(allocator, client, "70.8",
+        \\sales.customers.filter(Address.City = "Boston").count()
+    , 31);
+
+    yql_pass += pass_count - p6_yql_start;
+    yql_fail += fail_count - p6_yql_fail_start;
+
+    std.debug.print("\n═══ Phase 6: Builder Nested Field Tests ═══\n\n", .{});
+
+    // ── Category 71: Builder Nested Field ──
+    std.debug.print("── Category 71: Builder Nested Field ──\n", .{});
+
+    // 71.1: Address.City = "New York" → 46
+    testBuilderCount(client, "71.1", "customers.where(Address.City=New York).count()", &b70_1, 46);
+
+    // 71.2: Address.State = "CA" → 111
+    testBuilderCount(client, "71.2", "customers.where(Address.State=CA).count()", &b70_2, 111);
+
+    // 71.3: Address.City = "Chicago" → 49
+    testBuilderCount(client, "71.3", "customers.where(Address.City=Chicago).count()", &b70_3, 49);
+
+    // 71.4: Address.State = "TX" → 84
+    testBuilderCount(client, "71.4", "customers.where(Address.State=TX).count()", &b70_4, 84);
+
+    // 71.5: Address.Country = "US" → 635
+    testBuilderCount(client, "71.5", "customers.where(Address.Country=US).count()", &b70_5, 635);
+
+    // 71.6: Address.State = "FL" → 53
+    testBuilderCount(client, "71.6", "customers.where(Address.State=FL).count()", &b70_6, 53);
+
+    // 71.7: Sort by nested field — orderBy(Address.City, asc).limit(5) → all Atlanta
+    testBuilderNestedStrOrder(
+        client,
+        "71.7",
+        "customers.orderBy(Address.City,asc).limit(5)",
+        &b70_7,
+        "Address.City",
+        &.{ "Atlanta", "Atlanta", "Atlanta", "Atlanta", "Atlanta" },
+    );
+
+    // 71.8: Filter+Sort — Address.State=NY, orderBy(Address.ZipCode,asc).limit(5)
+    testBuilderNestedStrOrder(
+        client,
+        "71.8",
+        "customers.where(State=NY).orderBy(ZipCode,asc).limit(5)",
+        &b70_8,
+        "Address.State",
+        &.{ "NY", "NY", "NY", "NY", "NY" },
+    );
+
+    const builder_pass = pass_count - yql_pass;
+    const builder_fail = fail_count - yql_fail;
 
     // ════════════════════════════════════════════════════════════════
     // Final Summary

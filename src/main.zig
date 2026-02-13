@@ -16,6 +16,7 @@ const ProductCategory = @import("./model/ProductCategory.zig").ProductCategory;
 const ProductSubCategory = @import("./model/ProductSubCategory.zig").ProductSubCategory;
 const Vendor = @import("./model/Vendor.zig").Vendor;
 const VendorProduct = @import("./model/VendorProduct.zig").VendorProduct;
+const Address = @import("./model/Address.zig").Address;
 
 const json_dir = "./src/json/"; // Relative to project root
 
@@ -151,6 +152,7 @@ fn setupSchema(client: *ShinyDbClient) !void {
         "productsubcategories",
         "vendors",
         "vendorproducts",
+        "addresses",
     };
 
     for (stores) |store_name| {
@@ -182,6 +184,7 @@ fn loadAllData(allocator: std.mem.Allocator, client: *ShinyDbClient, io: Io) !vo
     try loadJsonFile(ProductSubCategory, allocator, client, "productsubcategories", json_dir ++ "productsubcategories.json", io);
     try loadJsonFile(Vendor, allocator, client, "vendors", json_dir ++ "vendors.json", io);
     try loadJsonFile(VendorProduct, allocator, client, "vendorproducts", json_dir ++ "vendorproduct.json", io);
+    try loadJsonFile(Address, allocator, client, "addresses", json_dir ++ "addresses.json", io);
     try loadJsonFile(Order, allocator, client, "orders", json_dir ++ "orders.json", io);
 
     std.debug.print("\nData loading complete!\n", .{});
@@ -198,6 +201,7 @@ fn loadSmallDataset(allocator: std.mem.Allocator, client: *ShinyDbClient, io: Io
     try loadJsonFile(ProductSubCategory, allocator, client, "productsubcategories", json_dir ++ "productsubcategories.json", io);
     try loadJsonFile(Vendor, allocator, client, "vendors", json_dir ++ "vendors.json", io);
     try loadJsonFile(VendorProduct, allocator, client, "vendorproducts", json_dir ++ "vendorproduct.json", io);
+    try loadJsonFile(Address, allocator, client, "addresses", json_dir ++ "addresses.json", io);
 
     // Load only first 100 orders
     try loadJsonFileLimit(Order, allocator, client, "orders", json_dir ++ "orders.json", 100, io);
