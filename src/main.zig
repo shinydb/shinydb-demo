@@ -78,15 +78,18 @@ pub fn main() !void {
         try setupSchema(client);
     } else if (std.mem.eql(u8, command, "load")) {
         try loadAllData(allocator, client, io);
+        try createIndexes(client);
         try flushData(client);
     } else if (std.mem.eql(u8, command, "load-small")) {
         try loadSmallDataset(allocator, client, io);
+        try createIndexes(client);
         try flushData(client);
     } else if (std.mem.eql(u8, command, "cleanup")) {
         try cleanup(client);
     } else if (std.mem.eql(u8, command, "all")) {
         try setupSchema(client);
         try loadAllData(allocator, client, io);
+        try createIndexes(client);
         try flushData(client);
     } else {
         std.debug.print("Unknown command: {s}\n", .{command});
@@ -266,6 +269,58 @@ fn loadJsonFileLimit(comptime T: type, allocator: std.mem.Allocator, client: *Sh
         std.debug.print(" ({d} errors)", .{errors});
     }
     std.debug.print("\n", .{});
+}
+
+fn createIndexes(client: *ShinyDbClient) !void {
+    std.debug.print("\n=== Creating secondary indexes ===\n", .{});
+
+    const indexes = [_]struct { ns: []const u8, field: []const u8, field_type: proto.FieldType }{
+        // orders
+        .{ .ns = "sales.orders.employee_id_idx", .field = "EmployeeID", .field_type = .I64 },
+        .{ .ns = "sales.orders.customer_id_idx", .field = "CustomerID", .field_type = .I64 },
+        .{ .ns = "sales.orders.total_due_idx", .field = "TotalDue", .field_type = .F64 },
+        // employees
+        .{ .ns = "sales.employees.employee_id_idx", .field = "EmployeeID", .field_type = .I64 },
+        .{ .ns = "sales.employees.gender_idx", .field = "Gender", .field_type = .String },
+        .{ .ns = "sales.employees.marital_status_idx", .field = "MaritalStatus", .field_type = .String },
+        // products
+        .{ .ns = "sales.products.makeflag_idx", .field = "MakeFlag", .field_type = .I64 },
+        .{ .ns = "sales.products.listprice_idx", .field = "ListPrice", .field_type = .F64 },
+        .{ .ns = "sales.products.subcategory_id_idx", .field = "SubCategoryID", .field_type = .I64 },
+        // vendors
+        .{ .ns = "sales.vendors.activeflag_idx", .field = "ActiveFlag", .field_type = .I64 },
+        .{ .ns = "sales.vendors.credit_rating_idx", .field = "CreditRating", .field_type = .I64 },
+        // productcategories
+        .{ .ns = "sales.productcategories.category_name_idx", .field = "CategoryName", .field_type = .String },
+        // customers (nested fields)
+        .{ .ns = "sales.customers.address_city", .field = "Address.City", .field_type = .String },
+        .{ .ns = "sales.customers.address_state", .field = "Address.State", .field_type = .String },
+        .{ .ns = "sales.customers.address_country", .field = "Address.Country", .field_type = .String },
+    };
+
+    var created: usize = 0;
+    var skipped: usize = 0;
+
+    for (indexes) |idx| {
+        client.create(proto.Index{
+            .id = 0,
+            .store_id = 0,
+            .ns = idx.ns,
+            .field = idx.field,
+            .field_type = idx.field_type,
+            .unique = false,
+            .description = null,
+            .created_at = 0,
+        }) catch {
+            std.debug.print("  Index '{s}' already exists, skipping\n", .{idx.ns});
+            skipped += 1;
+            continue;
+        };
+        std.debug.print("  Created index '{s}' on field '{s}'\n", .{ idx.ns, idx.field });
+        created += 1;
+    }
+
+    std.debug.print("Index creation complete: {d} created, {d} skipped\n", .{ created, skipped });
 }
 
 fn cleanup(client: *ShinyDbClient) !void {
